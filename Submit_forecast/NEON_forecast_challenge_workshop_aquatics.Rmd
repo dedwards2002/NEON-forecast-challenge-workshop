@@ -16,6 +16,7 @@ editor_options:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+yay! 
 # This R markdown document
 
 This document presents workshop materials to get you started on generating forecasts specifically for submission to the EFI-NEON Forecasting Challenge.

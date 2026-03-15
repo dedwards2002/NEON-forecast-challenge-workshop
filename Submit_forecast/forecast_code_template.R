@@ -91,6 +91,7 @@ weather_future_daily <- weather_future |>
 
 # ----- Fit model & generate forecast----
 
+
 # Generate a dataframe to fit the model to 
 targets_lm <- targets |> 
   pivot_wider(names_from = 'variable', values_from = 'observation') |> 
@@ -110,28 +111,44 @@ for(i in 1:length(focal_sites)) {
   noaa_future_site <- weather_future_daily |> 
     filter(site_id == curr_site)
   
-  #Fit linear model based on past data: water temperature = m * air temperature + b
-  #you will need to change the variable on the left side of the ~ if you are forecasting oxygen or chla
+  # Fit linear model based on past data
   fit <- lm(site_target$temperature ~ site_target$air_temperature)
-  # fit <- lm(site_target$temperature ~ ....)
+  fit_summary <- summary(fit)
   
-  # use linear regression to forecast water temperature for each ensemble member
-  # You will need to modify this line of code if you add additional weather variables or change the form of the model
-  # The model here needs to match the model used in the lm function above (or what model you used in the fit)
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+  # --- UNCERTAINTY EXTRACTION ---
+  # 1. Extract coefficients and their standard errors
+  coeffs <- fit$coefficients
+  params_se <- fit_summary$coefficients[, 2]
+  
+  # 2. Extract process noise (sigma)
+  sigma <- sd(fit$residuals, na.rm = TRUE)
+  
+  # Determine how many predictions
+  n_preds <- nrow(noaa_future_site)
+  
+  # Add parameter uncertainty based on Module 6
+  param_df <- data.frame(
+    beta1 = rnorm(n_preds, mean = coeffs[1], sd = params_se[1]), # Randomized Intercept
+    beta2 = rnorm(n_preds, mean = coeffs[2], sd = params_se[2])  # Randomized Slope
+  )
+  
+  # --- FORECAST GENERATION ---
+  forecasted_temperature <- 
+    param_df$beta1 +                                           # Parameter Uncertainty (Intercept)
+    (param_df$beta2 * noaa_future_site$air_temperature) +      # Parameter Uncertainty (Slope) * Driver Uncertainty
+    rnorm(n_preds, mean = 0, sd = sigma)                       # Process Uncertainty
   
   # put all the relevant information into a tibble that we can bind together
   curr_site_df <- tibble(datetime = noaa_future_site$datetime,
                          site_id = curr_site,
                          parameter = noaa_future_site$parameter,
                          prediction = forecasted_temperature,
-                         variable = "temperature") #Change this if you are forecasting a different variable
+                         variable = "temperature") 
   
   forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
-  message(curr_site, 'forecast run')
+  message(curr_site, ' forecast run')
   
 }
-
 
 #--------------------------#
 

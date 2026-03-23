@@ -91,12 +91,25 @@ weather_future_daily <- weather_future |>
 
 # ----- Fit model & generate forecast----
 
-
-# Generate a dataframe to fit the model to 
+# 1. Prepare historical data with the Lag and Derived Covariate
 targets_lm <- targets |> 
   pivot_wider(names_from = 'variable', values_from = 'observation') |> 
-  left_join(weather_past_daily, 
-            by = c("datetime","site_id"))
+  left_join(weather_past_daily, by = c("datetime","site_id")) |>
+  arrange(site_id, datetime) |>
+  group_by(site_id) |>
+  mutate(
+    # The 1-day lag in water temperature
+    wtemp_yday = lag(temperature, 1),
+    
+    # The Derived Covariate: Prior 7-day mean air temperature
+    prior_week_mean_airt = (lag(air_temperature, 1) + lag(air_temperature, 2) + 
+                              lag(air_temperature, 3) + lag(air_temperature, 4) + 
+                              lag(air_temperature, 5) + lag(air_temperature, 6) + 
+                              lag(air_temperature, 7)) / 7
+  ) |>
+  ungroup() |>
+  # Drop NAs created by the 7-day lag so the model fits cleanly
+  filter(complete.cases(temperature, wtemp_yday, air_temperature, prior_week_mean_airt))
 
 # Loop through each site to fit the model
 forecast_df <- NULL
@@ -105,54 +118,101 @@ for(i in 1:length(focal_sites)) {
   
   curr_site <- focal_sites[i]
   
-  site_target <- targets_lm |>
-    filter(site_id == curr_site)
-  
-  noaa_future_site <- weather_future_daily |> 
-    filter(site_id == curr_site)
+  site_target <- targets_lm |> filter(site_id == curr_site)
+  noaa_future_site <- weather_future_daily |> filter(site_id == curr_site)
   
   # Fit linear model based on past data
-  fit <- lm(site_target$temperature ~ site_target$air_temperature)
+  fit <- lm(temperature ~ wtemp_yday + air_temperature + prior_week_mean_airt, data = site_target)
   fit_summary <- summary(fit)
   
   # --- UNCERTAINTY EXTRACTION ---
-  # 1. Extract coefficients and their standard errors
   coeffs <- fit$coefficients
   params_se <- fit_summary$coefficients[, 2]
-  
-  # 2. Extract process noise (sigma)
   sigma <- sd(fit$residuals, na.rm = TRUE)
   
-  # Determine how many predictions
-  n_preds <- nrow(noaa_future_site)
+  # Assignment parameters
+  n_members <- 310
+  forecast_start_date <- forecast_date
+  forecasted_dates <- seq(from = forecast_start_date, to = max(noaa_future_site$datetime), by = "day")
   
-  # Add parameter uncertainty based on Module 6
-  param_df <- data.frame(
-    beta1 = rnorm(n_preds, mean = coeffs[1], sd = params_se[1]), # Randomized Intercept
-    beta2 = rnorm(n_preds, mean = coeffs[2], sd = params_se[2])  # Randomized Slope
+  # --- INITIAL CONDITIONS UNCERTAINTY ---
+  curr_wt <- tail(site_target$temperature, 1) # Last known observation
+  ic_sd <- 0.2 # Estimated observation error
+  ic_uc <- rnorm(n = n_members, mean = curr_wt, sd = ic_sd)
+  
+  ic_df <- tibble(
+    forecast_date = rep(forecast_start_date, times = n_members),
+    ensemble_member = 1:n_members,
+    forecast_variable = "temperature",
+    value = ic_uc,
+    uc_type = "total"
   )
   
-  # --- FORECAST GENERATION ---
-  forecasted_temperature <- 
-    param_df$beta1 +                                           # Parameter Uncertainty (Intercept)
-    (param_df$beta2 * noaa_future_site$air_temperature) +      # Parameter Uncertainty (Slope) * Driver Uncertainty
-    rnorm(n_preds, mean = 0, sd = sigma)                       # Process Uncertainty
+  # --- PARAMETER UNCERTAINTY ---
+  param_df <- data.frame(
+    beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+    beta2 = rnorm(n_members, coeffs[2], params_se[2]),
+    beta3 = rnorm(n_members, coeffs[3], params_se[3]),
+    beta4 = rnorm(n_members, coeffs[4], params_se[4])
+  )
   
-  # put all the relevant information into a tibble that we can bind together
-  curr_site_df <- tibble(datetime = noaa_future_site$datetime,
-                         site_id = curr_site,
-                         parameter = noaa_future_site$parameter,
-                         prediction = forecasted_temperature,
-                         variable = "temperature") 
+  # Set up empty dataframe and insert Initial Conditions
+  forecast_total_unc <- tibble(
+    forecast_date = rep(forecasted_dates, times = n_members),
+    ensemble_member = rep(1:n_members, each = length(forecasted_dates)),
+    forecast_variable = "temperature",
+    value = as.double(NA),
+    uc_type = "total"
+  ) |> 
+    rows_update(ic_df, by = c("forecast_date","ensemble_member","forecast_variable","uc_type")) 
+  
+  # Setup rolling memory for our derived covariate
+  recent_air_temps <- weather_past_daily |> 
+    filter(site_id == curr_site, datetime <= forecast_start_date) |> 
+    tail(7) |> 
+    pull(air_temperature)
+  
+  # --- FORECAST GENERATION (Mod 6 Time Loop) ---
+  for(d in 2:length(forecasted_dates)) {
+    
+    # pull dataframes for relevant dates
+    temp_pred <- forecast_total_unc |> filter(forecast_date == forecasted_dates[d])
+    temp_lag <- forecast_total_unc |> filter(forecast_date == forecasted_dates[d-1])
+    temp_driv <- noaa_future_site |> filter(datetime == forecasted_dates[d])
+    
+    # THE CAROUSEL: Expand 31 weather ensembles to 310
+    temp_driv_310 <- temp_driv[rep(1:nrow(temp_driv), length.out = n_members), ]
+    
+    # Calculate derived covariate for today
+    curr_prior_week_mean <- mean(recent_air_temps, na.rm = TRUE)
+    
+    # run model using param_df, temp_lag, and adding process noise
+    temp_pred$value <- param_df$beta1 + 
+      temp_lag$value * param_df$beta2 + 
+      temp_driv_310$air_temperature * param_df$beta3 + 
+      curr_prior_week_mean * param_df$beta4 + 
+      rnorm(n = n_members, mean = 0, sd = sigma)
+    
+    # insert values back into the forecast dataframe
+    forecast_total_unc <- forecast_total_unc |> 
+      rows_update(temp_pred, by = c("forecast_date","ensemble_member","forecast_variable","uc_type"))
+    
+    # Update rolling memory for tomorrow
+    recent_air_temps <- c(recent_air_temps[-1], mean(temp_driv_310$air_temperature, na.rm = TRUE))
+  }
+  
+  curr_site_df <- forecast_total_unc |>
+    filter(forecast_date > forecast_start_date) |>
+    rename(datetime = forecast_date, parameter = ensemble_member, prediction = value) |>
+    mutate(site_id = curr_site, variable = "temperature") |>
+    select(datetime, site_id, parameter, prediction, variable)
   
   forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
-  message(curr_site, ' forecast run')
+  message(curr_site, ' 310-member forecast run complete')
   
 }
 
 #--------------------------#
-
-
 #---- Covert to EFI standard ----
 
 # Make forecast fit the EFI standards

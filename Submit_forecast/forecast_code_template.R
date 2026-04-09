@@ -166,11 +166,18 @@ for(i in 1:length(focal_sites)) {
   ) |> 
     rows_update(ic_df, by = c("forecast_date","ensemble_member","forecast_variable","uc_type")) 
   
-  # Setup rolling memory for our derived covariate
-  recent_air_temps <- weather_past_daily |> 
+  # --- UPDATED: Setup rolling memory for derived covariate ---
+  initial_past_temps <- weather_past_daily |> 
     filter(site_id == curr_site, datetime <= forecast_start_date) |> 
     tail(7) |> 
     pull(air_temperature)
+  
+  # Create a 310 (rows) x 7 (columns) matrix.
+  recent_air_temps_matrix <- matrix(
+    rep(initial_past_temps, each = n_members),
+    nrow = n_members,
+    ncol = 7
+  )
   
   # --- FORECAST GENERATION (Mod 6 Time Loop) ---
   for(d in 2:length(forecasted_dates)) {
@@ -183,8 +190,8 @@ for(i in 1:length(focal_sites)) {
     # THE CAROUSEL: Expand 31 weather ensembles to 310
     temp_driv_310 <- temp_driv[rep(1:nrow(temp_driv), length.out = n_members), ]
     
-    # Calculate derived covariate for today
-    curr_prior_week_mean <- mean(recent_air_temps, na.rm = TRUE)
+    # Calculate derived covariate for today (row-wise means for all 310 members)
+    curr_prior_week_mean <- rowMeans(recent_air_temps_matrix, na.rm = TRUE)
     
     # run model using param_df, temp_lag, and adding process noise
     temp_pred$value <- param_df$beta1 + 
@@ -198,7 +205,11 @@ for(i in 1:length(focal_sites)) {
       rows_update(temp_pred, by = c("forecast_date","ensemble_member","forecast_variable","uc_type"))
     
     # Update rolling memory for tomorrow
-    recent_air_temps <- c(recent_air_temps[-1], mean(temp_driv_310$air_temperature, na.rm = TRUE))
+    # Drop the oldest day (column 1) and bind the new forecast day (column 7)
+    recent_air_temps_matrix <- cbind(
+      recent_air_temps_matrix[, -1], 
+      temp_driv_310$air_temperature
+    )
   }
   
   curr_site_df <- forecast_total_unc |>
@@ -255,3 +266,38 @@ plot_file_name <- paste0("Submit_forecast/", forecast_df_EFI$variable[1], '-', f
 ggsave(plot_file_name)
 
 
+# In class assignment  ####
+all_results <- duckdbfs::open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature
+", s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
+
+my_forecast <- all_results |> 
+  filter(reference_datetime == as_datetime("2025-03-24 00:00:00"),
+         site_id == "BARC",
+         model_id %in% c("climatology", "persistenceRW")) |> 
+  collect()
+
+single_forecast <- my_forecast |> 
+  filter( model_id == "persistenceRW",
+          datetime == as_datetime("2025-03-27 00:00:00"))
+
+
+
+
+
+my_forecast |> 
+  filter(model_id == "climatology") |> 
+  pivot_wider(names_from = parameter, values_from = prediction ) |> 
+  mutate(lower_2.5 = mu - 1.96*sigma,
+         upper_97.5 = mu +1.96*sigma) |> 
+  ggplot(aes(x = datetime)) +
+  geom_ribbon(aes(ymin = lower_2.5, ymax= upper_97.5), fill = "lightblue")+
+  geom_line(aes(y = mu))
+
+
+my_forecast |> 
+  filter(model_id == "persistenceRW") |> 
+  ggplot(aes(x = datetime, y= prediciton, group = parameter)) +
+  geom_line()
+
+
+s3://anonymous@bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature/model_id=climatology?endpoint_override=sdsc.osn.xsede.org

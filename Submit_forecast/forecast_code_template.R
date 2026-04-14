@@ -267,37 +267,37 @@ ggsave(plot_file_name)
 
 
 # In class assignment  ####
-all_results <- duckdbfs::open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature
-", s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
-
-my_forecast <- all_results |> 
-  filter(reference_datetime == as_datetime("2025-03-24 00:00:00"),
-         site_id == "BARC",
-         model_id %in% c("climatology", "persistenceRW")) |> 
-  collect()
-
-single_forecast <- my_forecast |> 
-  filter( model_id == "persistenceRW",
-          datetime == as_datetime("2025-03-27 00:00:00"))
-
-
-
-
-
-my_forecast |> 
-  filter(model_id == "climatology") |> 
-  pivot_wider(names_from = parameter, values_from = prediction ) |> 
-  mutate(lower_2.5 = mu - 1.96*sigma,
-         upper_97.5 = mu +1.96*sigma) |> 
-  ggplot(aes(x = datetime)) +
-  geom_ribbon(aes(ymin = lower_2.5, ymax= upper_97.5), fill = "lightblue")+
-  geom_line(aes(y = mu))
-
-
-my_forecast |> 
-  filter(model_id == "persistenceRW") |> 
-  ggplot(aes(x = datetime, y= prediciton, group = parameter)) +
-  geom_line()
-
-
-s3://anonymous@bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature/model_id=climatology?endpoint_override=sdsc.osn.xsede.org
+# all_results <- duckdbfs::open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature
+# ", s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
+# 
+# my_forecast <- all_results |> 
+#   filter(reference_datetime == as_datetime("2025-03-24 00:00:00"),
+#          site_id == "BARC",
+#          model_id %in% c("climatology", "persistenceRW")) |> 
+#   collect()
+# 
+# single_forecast <- my_forecast |> 
+#   filter( model_id == "persistenceRW",
+#           datetime == as_datetime("2025-03-27 00:00:00"))
+# 
+# 
+# 
+# 
+# 
+# my_forecast |> 
+#   filter(model_id == "climatology") |> 
+#   pivot_wider(names_from = parameter, values_from = prediction ) |> 
+#   mutate(lower_2.5 = mu - 1.96*sigma,
+#          upper_97.5 = mu +1.96*sigma) |> 
+#   ggplot(aes(x = datetime)) +
+#   geom_ribbon(aes(ymin = lower_2.5, ymax= upper_97.5), fill = "lightblue")+
+#   geom_line(aes(y = mu))
+# 
+# 
+# my_forecast |> 
+#   filter(model_id == "persistenceRW") |> 
+#   ggplot(aes(x = datetime, y= prediciton, group = parameter)) +
+#   geom_line()
+# 
+# 
+# s3://anonymous@bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature/model_id=climatology?endpoint_override=sdsc.osn.xsede.org

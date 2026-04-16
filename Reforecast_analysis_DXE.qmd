@@ -1,0 +1,255 @@
+---
+title: "DXE_reforecast_analysis"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+
+## Water temperature reforecasting for Lake BARCO - 1 year horizon compared to climatology and persistence
+
+# Set up
+
+```{r}
+# ------ Load packages -----
+library(tidyverse)
+library(lubridate)
+library(neon4cast)
+
+# --- Configuration ---
+my_model_id <- 'Dom_BARC_Reforecast'
+focal_sites <- c("BARC")
+target_variable <- "temperature"
+met_variables <- c("air_temperature")
+
+reforecast_dates <- seq(ymd('2023-01-01'), ymd('2023-12-31'), by = "week")
+horizon_days <- 30 
+n_members <- 31
+
+#------- 1. Read Target Data --------
+message("--- Downloading NEON Targets ---")
+targets_url <- "https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz"
+targets <- read_csv(targets_url, show_col_types = FALSE) |>
+  filter(site_id %in% focal_sites, variable == target_variable) |>
+  mutate(datetime = as_date(datetime))
+
+# ------ 2. Download Historical Weather (For Training) ------
+message("--- Downloading Historical NOAA Stage 3 ---")
+weather_past_s3 <- neon4cast::noaa_stage3()
+weather_past <- weather_past_s3 |> 
+  dplyr::filter(site_id %in% focal_sites, datetime >= ymd('2017-01-01'), variable %in% met_variables) |> 
+  dplyr::collect()
+
+weather_past_daily <- weather_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  mutate(prediction = prediction - 273.15) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+
+targets_lm <- targets |> 
+  pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+  left_join(weather_past_daily, by = c("datetime","site_id")) |>
+  arrange(site_id, datetime) |>
+  group_by(site_id) |>
+  mutate(
+    wtemp_yday = lag(temperature, 1),
+    prior_week_mean_airt = (lag(air_temperature, 1) + lag(air_temperature, 2) + 
+                              lag(air_temperature, 3) + lag(air_temperature, 4) + 
+                              lag(air_temperature, 5) + lag(air_temperature, 6) + 
+                              lag(air_temperature, 7)) / 7
+  ) |>
+  ungroup() |>
+  filter(complete.cases(temperature, wtemp_yday, air_temperature, prior_week_mean_air
+
+
+
+```
+
+## Reforecast code
+
+```{r}
+all_reforecasts <- NULL
+
+for(curr_date in reforecast_dates) {
+  
+  ref_date <- as_date(curr_date)
+  curr_site <- focal_sites[1]
+  
+  site_target <- targets_lm |> filter(site_id == curr_site, datetime < ref_date)
+  noaa_date <- ref_date - days(1)
+  
+  # historical Stage 2 forecast
+  weather_future_s3 <- tryCatch({
+    neon4cast::noaa_stage2(start_date = as.character(noaa_date)) |> 
+      dplyr::filter(datetime >= ref_date, site_id == curr_site, variable %in% met_variables) |> 
+      dplyr::collect()
+  }, error = function(e) { return(data.frame()) })
+  
+  if(nrow(weather_future_s3) == 0) next 
+  
+  noaa_future_site <- weather_future_s3 |> 
+    mutate(datetime = as_date(datetime)) |> 
+    group_by(datetime, site_id, parameter, variable) |> 
+    summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+    mutate(prediction = prediction - 273.15) |> 
+    pivot_wider(names_from = variable, values_from = prediction) |> 
+    select(any_of(c('datetime', 'site_id', met_variables, 'parameter')))
+  
+  if(nrow(site_target) < 10 | nrow(noaa_future_site) < horizon_days) next 
+  
+  fit <- lm(temperature ~ wtemp_yday + air_temperature + prior_week_mean_airt, data = site_target)
+  coeffs <- fit$coefficients
+  params_se <- summary(fit)$coefficients[, 2]
+  sigma <- sd(fit$residuals, na.rm = TRUE)
+  
+  forecasted_dates <- seq(from = ref_date, to = max(noaa_future_site$datetime), by = "day")
+  curr_wt <- tail(site_target$temperature, 1) 
+  
+  ic_uc <- rnorm(n = n_members, mean = curr_wt, sd = 0.2)
+  ic_df <- tibble(forecast_date = rep(ref_date, times = n_members), ensemble_member = 1:n_members, forecast_variable = target_variable, value = ic_uc, uc_type = "total")
+  
+  param_df <- data.frame(
+    beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+    beta2 = rnorm(n_members, coeffs[2], params_se[2]),
+    beta3 = rnorm(n_members, coeffs[3], params_se[3]),
+    beta4 = rnorm(n_members, coeffs[4], params_se[4])
+  )
+  
+  forecast_total_unc <- tibble(
+    forecast_date = rep(forecasted_dates, times = n_members),
+    ensemble_member = rep(1:n_members, each = length(forecasted_dates)),
+    forecast_variable = target_variable, value = as.double(NA), uc_type = "total"
+  ) |> rows_update(ic_df, by = c("forecast_date","ensemble_member","forecast_variable","uc_type")) 
+  
+  recent_air_temps_matrix <- matrix(
+    rep(tail(site_target$air_temperature, 7), each = n_members),
+    nrow = n_members, ncol = 7
+  )
+  
+  for(d in 2:length(forecasted_dates)) {
+    temp_pred <- forecast_total_unc |> filter(forecast_date == forecasted_dates[d])
+    temp_lag <- forecast_total_unc |> filter(forecast_date == forecasted_dates[d-1])
+    temp_driv <- noaa_future_site |> filter(datetime == forecasted_dates[d])
+    
+    if(nrow(temp_driv) == 0) next
+    temp_driv_expanded <- temp_driv[rep(1:nrow(temp_driv), length.out = n_members), ]
+    
+    curr_prior_week_mean <- rowMeans(recent_air_temps_matrix, na.rm = TRUE)
+    
+    temp_pred$value <- param_df$beta1 + 
+      temp_lag$value * param_df$beta2 + 
+      temp_driv_expanded$air_temperature * param_df$beta3 + 
+      curr_prior_week_mean * param_df$beta4 + 
+      rnorm(n = n_members, mean = 0, sd = sigma)
+    
+    forecast_total_unc <- forecast_total_unc |> rows_update(temp_pred, by = c("forecast_date","ensemble_member","forecast_variable","uc_type"))
+    recent_air_temps_matrix <- cbind(recent_air_temps_matrix[, -1], temp_driv_expanded$air_temperature)
+  }
+  
+  curr_reforecast_df <- forecast_total_unc |>
+    filter(forecast_date > ref_date) |>
+    rename(datetime = forecast_date, parameter = ensemble_member, prediction = value) |>
+    mutate(site_id = curr_site, variable = target_variable, reference_datetime = ref_date) |>
+    select(datetime, reference_datetime, site_id, parameter, prediction, variable)
+  
+  all_reforecasts <- dplyr::bind_rows(all_reforecasts, curr_reforecast_df)
+}
+
+# --- NEON Format ---
+user_df_EFI <- all_reforecasts |>
+  mutate(model_id = my_model_id, family = 'ensemble', duration = 'P1D', project_id = 'neon4cast', 
+         parameter = as.character(parameter)) |>
+  select(project_id, model_id, datetime, reference_datetime, duration, site_id, family, parameter, variable, prediction)
+```
+
+## Scoring
+
+```{r}
+library(score4cast)
+library(duckdbfs)
+
+message("--- Fetching Official NEON Baselines ---")
+s3_path <- "s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature"
+
+all_catalog_results <- duckdbfs::open_dataset(s3_path, s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
+
+# 1. Fetch ALL baselines for BARC, bypassing strict AWS date filters
+baseline_raw <- all_catalog_results |>
+  filter(
+    site_id == "BARC",
+    model_id %in% c("climatology", "persistenceRW")
+  ) |>
+  collect()
+
+# 2. Now that the data is safely in R memory, filter the dates flawlessly
+baseline_forecasts <- baseline_raw |>
+  mutate(ref_date_clean = as_date(reference_datetime)) |>
+  filter(ref_date_clean %in% as_date(reforecast_dates)) |>
+  select(-ref_date_clean) # remove the temporary column
+
+# 3. Combine with your model and Score!
+all_models_combined <- bind_rows(user_df_EFI, baseline_forecasts)
+
+message("--- Scoring All Models ---")
+scores_df <- score4cast::score(forecast = all_models_combined, target = targets)
+
+scoreboard <- scores_df |>
+  group_by(model_id) |>
+  summarize(mean_crps = round(mean(crps, na.rm = TRUE), 3)) |>
+  arrange(mean_crps) # Sorts lowest (best) to highest
+
+message("\n=========================================")
+message("       1-YEAR REFORECAST SCOREBOARD      ")
+message("=========================================")
+print(scoreboard |> as.data.frame())
+message("=========================================\n")
+
+```
+
+## Plot CRPS over time by model
+```{r}
+message("--- Calculating Mean CRPS by Horizon ---")
+
+horizon_scores <- scores_df |>
+  # Ensure the horizon is treated as a clean numeric value (days)
+  mutate(horizon_days = as.numeric(horizon)) |>
+  # Group by the model and how far into the future it's predicting
+  group_by(model_id, horizon_days) |>
+  summarize(mean_crps = mean(crps, na.rm = TRUE), .groups = "drop") |>
+  # Filter to only show future predictions (horizon > 0)
+  filter(!is.na(horizon_days), horizon_days > 0)
+
+message("--- Generating Plot ---")
+
+horizon_plot <- ggplot(horizon_scores, aes(x = horizon_days, y = mean_crps, color = model_id)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  theme_bw() +
+  # Custom colors to make the lines pop
+  scale_color_manual(values = c("dodgerblue4", "gray50", "darkorange")) + 
+  labs(
+    title = "Forecast Performance over Time (BARC)",
+    subtitle = "Mean CRPS by Forecast Horizon (Lower is better)",
+    x = "Horizon (Days into the future)",
+    y = "Mean CRPS",
+    color = "Model"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+print(horizon_plot)
+```
+
+
+Github link:  https://github.com/dedwards2002/NEON-forecast-challenge-workshop 
